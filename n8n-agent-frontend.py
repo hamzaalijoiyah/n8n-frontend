@@ -63,7 +63,7 @@ def trigger_llm_processing(session_id, message):
 
 
 def main():
-    st.title("Chat with LLM")
+    st.title("Chat with Sumhuman AI")
 
     # Initialize session state
     if "messages" not in st.session_state:
