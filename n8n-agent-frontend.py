@@ -3,7 +3,7 @@ import requests
 import uuid
 
 # Constants
-WEBHOOK_URL = "https://hamzaalijoiyah.app.n8n.cloud/webhook/3b0e1f5f-3a95-438a-aafe-442270633997"
+WEBHOOK_URL = "https://sumhuman.app.n8n.cloud/webhook/3b0e1f5f-3a95-438a-aafe-442270633997"
 # Set the header name to match your n8n Header Auth credential configuration
 N8N_HEADER_NAME = "Authorization"
 # Use Streamlit secrets to get the header value securely
