@@ -7,6 +7,7 @@ st.set_page_config(layout="wide")
 
 # --- Configuration ---
 N8N_SUBMIT_WEBHOOK_URL = "https://sumhuman.app.n8n.cloud/webhook-waiting/350"
+N8N_REPROMPT_WEBHOOK_URL = "https://sumhuman.app.n8n.cloud/webhook/your_reprompt_webhook_id" # <<< TODO: Replace with your actual reprompt webhook URL
 try:
     N8N_HEADER_VALUE = st.secrets["N8N_HEADER_VALUE"]
 except KeyError:
@@ -83,30 +84,59 @@ def trigger_n8n_webhook():
         st.error(f"🚨 Error connecting to n8n: {e}")
         return False
 
+def trigger_reprompt_webhook(session_id, prompt):
+    """Triggers the n8n reprompt webhook via POST request with auth header."""
+    if not session_id or not prompt:
+        st.warning("Session ID or prompt missing for reprompting.")
+        return False
+    headers = {
+        **AUTH_HEADER, # Include authorization header
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "sessionId": session_id,
+        "prompt": prompt
+    }
+    try:
+        response = requests.post(N8N_REPROMPT_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
+        if response.status_code == 200:
+            st.success("✅ Reprompt request sent successfully.")
+            return True
+        else:
+            st.error(f"❌ Failed to trigger reprompt webhook. Status Code: {response.status_code} - {response.text}")
+            return False
+    except requests.exceptions.RequestException as e:
+        st.error(f"🚨 Error connecting to reprompt webhook: {e}")
+        return False
+
 @st.cache_data(ttl=300)
 def fetch_images_from_supabase(session_id):
+    """Fetches images and the associated query from Supabase for a given session ID."""
     if not session_id:
-        return None
+        return None, None  # Return None for both images and query
     try:
         resp = supabase.table(SUPABASE_TABLE).select("image_url, query").eq("session_id", session_id).order("id").execute()
-        if hasattr(resp, 'data') and isinstance(resp.data, list):
-            return [
+        if hasattr(resp, 'data') and isinstance(resp.data, list) and resp.data:
+            images_data = [
                 {'imageUrl': item.get('image_url'), 'query': item.get('query')}
                 for item in resp.data
             ]
-        return []
+            # Assuming all images in the session have the same query, take it from the first item
+            query = resp.data[0].get('query', '') 
+            return images_data, query
+        return [], None # Return empty list and None query if no data
     except Exception as e:
         st.error(f"Supabase fetch error: {e}")
-        return None
+        return None, None
 
 # --- Query Params & Session State Initialization ---
 query_params = st.query_params
 url_session_id = query_params.get("sessionId")  # No indexing needed in Streamlit ≥1.27
-url_query = query_params.get("query", "")
+# url_query = query_params.get("query", "") # Removed: Query will be fetched from Supabase
 
 if 'session_id' not in st.session_state:
     st.session_state.session_id = url_session_id
-    st.session_state.original_query = url_query
+    # st.session_state.original_query = url_query # Removed: Query set after fetching
     st.session_state.current_index = 0
     st.session_state.image_decisions = {}
     st.session_state.submitted = False
@@ -133,22 +163,33 @@ if not st.session_state.get('session_id'):
     st.error("Missing 'sessionId'. Please ensure the link includes '?sessionId=...'")
     st.stop()
 
-st.info(f"Reviewing images for query: \"{st.session_state.original_query}\" (Session: {st.session_state.session_id})")
+# Display Session ID and Query prominently
+st.subheader("Image Review Session")
+col_info1, col_info2 = st.columns(2)
+with col_info1:
+    st.metric("Session ID", st.session_state.session_id)
+with col_info2:
+    st.metric("Original Query", st.session_state.original_query if st.session_state.original_query else "N/A")
+st.divider()
 
 # --- Load Data From Supabase Once Per Session ---
 if st.session_state.session_id and not st.session_state.data_loaded and not st.session_state.error_loading:
     with st.spinner(f"Loading images for session {st.session_state.session_id}..."):
-        data = fetch_images_from_supabase(st.session_state.session_id)
-        if data is not None:
-            st.session_state.all_images_data = data
+        images_data, fetched_query = fetch_images_from_supabase(st.session_state.session_id)
+        if images_data is not None:
+            st.session_state.all_images_data = images_data
+            st.session_state.original_query = fetched_query if fetched_query else "Query not found"
             st.session_state.current_index = 0
-            st.session_state.image_decisions = {i: 'keep' for i in range(len(data))}
+            st.session_state.image_decisions = {i: 'keep' for i in range(len(images_data))}
             st.session_state.data_loaded = True
-            st.success(f"Loaded {len(data)} images.")
+            st.success(f"Loaded {len(images_data)} images.")
             st.rerun()
         else:
             st.session_state.error_loading = True
-            st.error("No images found in Supabase for this session.")
+            st.session_state.original_query = "Error loading query"
+            st.error("Failed to load image data from Supabase for this session.")
+            # Optionally rerun or stop if loading fails critically
+            # st.rerun()
 
 # --- Main Review UI ---
 if st.session_state.data_loaded:
@@ -168,7 +209,8 @@ if st.session_state.data_loaded:
         col1, col2 = st.columns([2, 1])
         with col1:
             if img_url:
-                st.image(img_url, caption=f"Image {current_idx + 1} (Query: {img_query})", use_column_width=True)
+                # Use use_container_width instead of the deprecated use_column_width
+                st.image(img_url, caption=f"Image {current_idx + 1}", use_container_width=True)
             else:
                 st.warning("Image URL missing.")
 
@@ -225,18 +267,28 @@ if st.session_state.data_loaded:
 
     elif not st.session_state.error_loading:
         st.warning("No images found in Supabase for this session.")
-        new_prompt = st.text_area("Provide instructions or a query:", value=st.session_state.original_query)
-        if st.button("🔄 Request New Images", disabled=st.session_state.submitted or not new_prompt.strip()):
-            st.warning("This action requires backend integration.")
+        # Removed the old placeholder button here
 
 elif st.session_state.error_loading:
     st.error("Could not load image data. Please check Supabase connection.")
-    new_prompt = st.text_area("Provide instructions or a refined query:", value=st.session_state.original_query)
-    if st.button("🔄 Request New Images", disabled=st.session_state.submitted or not new_prompt.strip()):
-        st.warning("This action requires backend integration.")
+    # Removed the old placeholder button here
 
 else:
     st.info("Initializing...")
+
+# --- Reprompt Section --- (Always visible unless submitted)
+st.divider()
+st.subheader("Reprompt Agent")
+if not st.session_state.submitted:
+    new_prompt = st.text_area("Provide new instructions or a refined query:", value=st.session_state.original_query, key="reprompt_text_area")
+    if st.button("🔄 Send New Prompt to Agent", key="reprompt_button", disabled=not new_prompt.strip()):
+        if trigger_reprompt_webhook(st.session_state.session_id, new_prompt):
+            # Optionally clear or update state after successful reprompt
+            st.info("Reprompt sent. You might need to refresh or wait for new data.")
+        else:
+            st.error("Failed to send reprompt request.")
+elif st.session_state.submitted:
+    st.info("Review already submitted. Reprompting is disabled.")
 
 # --- Debug Info ---
 with st.expander("Debug Info"):
