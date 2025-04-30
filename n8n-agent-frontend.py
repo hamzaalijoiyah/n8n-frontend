@@ -18,14 +18,15 @@ def generate_session_id():
     return str(uuid.uuid4())
 
 # Modified function to trigger the n8n workflow asynchronously
-def trigger_llm_processing(session_id, message):
+def trigger_llm_processing(session_id, message, email): # Add email parameter
     headers = {
         N8N_HEADER_NAME: N8N_HEADER_VALUE, # Use the secret value
         "Content-Type": "application/json"
     }
     payload = {
         "sessionId": session_id,
-        "chatInput": message
+        "chatInput": message,
+        "email": email # Add email to payload
     }
 
     # Debug information
@@ -65,37 +66,58 @@ def trigger_llm_processing(session_id, message):
 def main():
     st.title("Chat with Sumhuman AI")
 
-    # Initialize session state
+    # Initialize session state for messages and session ID if they don't exist
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "session_id" not in st.session_state:
         st.session_state.session_id = generate_session_id()
-        print(f"New Session ID generated: {st.session_state.session_id}") # Add log for session ID
+        print(f"New Session ID generated: {st.session_state.session_id}")
 
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
+    # Check if email is already collected
+    if "email" not in st.session_state:
+        st.subheader("Please enter your email to start chatting:")
+        email_input = st.text_input("Email Address", key="email_input")
+        submit_button = st.button("Submit Email")
 
-    # User input
-    user_input = st.chat_input("Type your message here...")
+        if submit_button and email_input:
+            # Basic validation (optional: add more robust validation)
+            if "@" in email_input and "." in email_input:
+                st.session_state.email = email_input
+                print(f"Email collected: {st.session_state.email}")
+                st.rerun() # Rerun the app to show the chat interface
+            else:
+                st.error("Please enter a valid email address.")
+        elif submit_button:
+             st.error("Email address cannot be empty.")
 
-    if user_input:
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.write(user_input)
+    else:
+        # Email is collected, show the chat interface
+        st.write(f"Chatting as: {st.session_state.email}") # Display the email
 
-        # Trigger the LLM processing asynchronously
-        # Display a temporary "processing" message
-        with st.chat_message("assistant"):
-            with st.spinner("Sending request to agent..."):
-                 confirmation_message = trigger_llm_processing(st.session_state.session_id, user_input)
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
 
-            # Add the confirmation/error message to chat history
-            st.session_state.messages.append({"role": "assistant", "content": confirmation_message})
-            # Re-run to display the new message immediately
-            st.rerun()
+        # User input
+        user_input = st.chat_input("Type your message here...")
+
+        if user_input:
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.write(user_input)
+
+            # Trigger the LLM processing asynchronously, passing the email
+            with st.chat_message("assistant"):
+                with st.spinner("Sending request to agent..."):
+                     # Pass email from session state
+                     confirmation_message = trigger_llm_processing(st.session_state.session_id, user_input, st.session_state.email)
+
+                # Add the confirmation/error message to chat history
+                st.session_state.messages.append({"role": "assistant", "content": confirmation_message})
+                # Re-run to display the new message immediately
+                st.rerun()
 
 
 if __name__ == "__main__":
