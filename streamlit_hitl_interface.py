@@ -6,8 +6,7 @@ from supabase import create_client, Client
 st.set_page_config(layout="wide")
 
 # --- Configuration ---
-N8N_SUBMIT_WEBHOOK_URL = "https://sumhuman.app.n8n.cloud/webhook-waiting/350"
-N8N_REPROMPT_WEBHOOK_URL = "https://sumhuman.app.n8n.cloud/webhook/your_reprompt_webhook_id" # <<< TODO: Replace with your actual reprompt webhook URL
+N8N_REPROMPT_WEBHOOK_URL = "https://sumhuman.app.n8n.cloud/webhook/3b0e1f5f-3a95-438a-aafe-442270633997"
 try:
     N8N_HEADER_VALUE = st.secrets["N8N_HEADER_VALUE"]
 except KeyError:
@@ -69,19 +68,53 @@ def delete_images_from_supabase(session_id, image_urls):
         st.exception(traceback.format_exc())
         return False
 
-def trigger_n8n_webhook():
-    """Triggers the n8n webhook via GET request with auth header."""
+# --- New Function ---
+def delete_all_images_for_session(session_id):
+    """Deletes ALL images from Supabase for a given session ID."""
+    if not session_id:
+        st.warning("No session ID provided for deletion.")
+        return False
     try:
-        response = requests.get(N8N_SUBMIT_WEBHOOK_URL, headers=AUTH_HEADER, timeout=20)
+        st.write(f"Attempting to delete all images for session: {session_id}")
+        result = (
+            supabase.table(SUPABASE_TABLE)
+            .delete()
+            .eq("session_id", session_id)
+            .execute()
+        )
+        # Check if deletion succeeded (even if 0 rows were affected, it's not an error)
+        if hasattr(result, 'data'):
+            deleted_count = len(result.data) if isinstance(result.data, list) else 0
+            st.success(f"{deleted_count} existing image record(s) deleted from Supabase for session {session_id}.")
+            return True
+        else:
+            st.error("Supabase deletion failed: Invalid response format.")
+            return False
+    except Exception as e:
+        st.error(f"Error deleting all images for session {session_id}: {e}")
+        import traceback
+        st.exception(traceback.format_exc())
+        return False
+# --- End New Function ---
+
+
+def trigger_n8n_webhook():
+    """Triggers the n8n webhook (resume URL) via GET request with auth header."""
+    resume_url = st.session_state.get('resume_url')
+    if not resume_url:
+        st.error("❌ Resume URL is missing. Cannot trigger n8n.")
+        return False
+    try:
+        response = requests.get(resume_url, headers=AUTH_HEADER, timeout=20) # Use resume_url from session state
         if response.status_code == 200:
-            st.success("✅ n8n execution started. Images marked for deletion have been removed.")
+            st.success("✅ n8n execution started using the resume URL. Images marked for deletion have been removed.")
             st.balloons()
             return True
         else:
-            st.error(f"❌ Failed to trigger n8n. Status Code: {response.status_code}")
+            st.error(f"❌ Failed to trigger n8n resume URL. Status Code: {response.status_code}")
             return False
     except requests.exceptions.RequestException as e:
-        st.error(f"🚨 Error connecting to n8n: {e}")
+        st.error(f"🚨 Error connecting to n8n resume URL: {e}")
         return False
 
 def trigger_reprompt_webhook(session_id, prompt):
@@ -95,7 +128,7 @@ def trigger_reprompt_webhook(session_id, prompt):
     }
     payload = {
         "sessionId": session_id,
-        "prompt": prompt
+        "chatInput": prompt  # Sends the new prompt under the key "prompt"
     }
     try:
         response = requests.post(N8N_REPROMPT_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
@@ -131,12 +164,12 @@ def fetch_images_from_supabase(session_id):
 
 # --- Query Params & Session State Initialization ---
 query_params = st.query_params
-url_session_id = query_params.get("sessionId")  # No indexing needed in Streamlit ≥1.27
-# url_query = query_params.get("query", "") # Removed: Query will be fetched from Supabase
+url_session_id = query_params.get("sessionId")
+url_resume_url = query_params.get("resumeUrl") # Get resumeUrl from query params
 
 if 'session_id' not in st.session_state:
     st.session_state.session_id = url_session_id
-    # st.session_state.original_query = url_query # Removed: Query set after fetching
+    st.session_state.resume_url = url_resume_url # Store resumeUrl in session state
     st.session_state.current_index = 0
     st.session_state.image_decisions = {}
     st.session_state.submitted = False
@@ -153,15 +186,20 @@ for key, default in {
     'all_images_data': [],
     'original_query': "",
     'data_loaded': False,
-    'error_loading': False
+    'error_loading': False,
+    'resume_url': None # Add resume_url to session state defaults
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# --- Validate Session ID ---
+# --- Validate Session ID and Resume URL ---
 if not st.session_state.get('session_id'):
     st.error("Missing 'sessionId'. Please ensure the link includes '?sessionId=...'")
     st.stop()
+
+if not st.session_state.get('resume_url'):
+    st.error("Missing 'resumeUrl'. Please ensure the link includes '&resumeUrl=...'")
+    st.stop() # Stop if resumeUrl is crucial
 
 # Display Session ID and Query prominently
 st.subheader("Image Review Session")
@@ -282,11 +320,19 @@ st.subheader("Reprompt Agent")
 if not st.session_state.submitted:
     new_prompt = st.text_area("Provide new instructions or a refined query:", value=st.session_state.original_query, key="reprompt_text_area")
     if st.button("🔄 Send New Prompt to Agent", key="reprompt_button", disabled=not new_prompt.strip()):
+        # Calls the updated function
         if trigger_reprompt_webhook(st.session_state.session_id, new_prompt):
-            # Optionally clear or update state after successful reprompt
-            st.info("Reprompt sent. You might need to refresh or wait for new data.")
+            # Clear relevant state and cache, then rerun to show loading/wait state
+            st.info("Reprompt sent. Clearing current view and waiting for new images...")
+            st.session_state.all_images_data = []
+            st.session_state.current_index = 0
+            st.session_state.image_decisions = {}
+            st.session_state.data_loaded = False # Force reload
+            st.session_state.error_loading = False
+            fetch_images_from_supabase.clear() # Clear cache
+            st.rerun() # Rerun to reflect state changes and trigger loading spinner
         else:
-            st.error("Failed to send reprompt request.")
+            st.error("Failed to complete the reprompt process.") # General error if any step failed
 elif st.session_state.submitted:
     st.info("Review already submitted. Reprompting is disabled.")
 
