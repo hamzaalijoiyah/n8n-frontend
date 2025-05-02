@@ -99,7 +99,10 @@ def delete_all_images_for_session(session_id):
 
 
 def trigger_n8n_webhook():
-    """Triggers the n8n webhook (resume URL) via GET request with auth header."""
+    """Triggers the n8n webhook (resume URL) via GET request with auth header.
+    Returns True if successful (200) or if a 409 Conflict occurs (workflow not waiting, which is acceptable for reprompt).
+    Returns False for other errors.
+    """
     resume_url = st.session_state.get('resume_url')
     if not resume_url:
         st.error("❌ Resume URL is missing. Cannot trigger n8n.")
@@ -107,37 +110,71 @@ def trigger_n8n_webhook():
     try:
         response = requests.get(resume_url, headers=AUTH_HEADER, timeout=20) # Use resume_url from session state
         if response.status_code == 200:
-            st.success("✅ n8n execution started using the resume URL. Images marked for deletion have been removed.")
-            st.balloons()
+            st.success("✅ n8n execution resumed/confirmed active using the resume URL.")
+            # Consider removing balloons if it's just confirming activity
+            # st.balloons() 
             return True
+        elif response.status_code == 409:
+            # Handle 409 Conflict specifically: Inform user but allow process to continue
+            st.info("ℹ️ Could not resume n8n workflow via resume URL (Status 409 - Conflict). This likely means the workflow was not in a waiting state. Proceeding with reprompt.")
+            return True # Treat 409 as non-blocking for the reprompt sequence
         else:
+            # Handle other non-200 errors
             st.error(f"❌ Failed to trigger n8n resume URL. Status Code: {response.status_code}")
             return False
     except requests.exceptions.RequestException as e:
         st.error(f"🚨 Error connecting to n8n resume URL: {e}")
         return False
 
-def trigger_reprompt_webhook(session_id, prompt):
+def trigger_reprompt_webhook(session_id, prompt, user_email): # Add user_email parameter
     """Triggers the n8n reprompt webhook via POST request with auth header."""
     if not session_id or not prompt:
         st.warning("Session ID or prompt missing for reprompting.")
         return False
+    # Optional: Add check for user_email if it's strictly required
+    # if not user_email:
+    #     st.warning("User email missing for reprompting.")
+    #     return False
     headers = {
         **AUTH_HEADER, # Include authorization header
         "Content-Type": "application/json"
     }
     payload = {
         "sessionId": session_id,
-        "chatInput": prompt  # Sends the new prompt under the key "prompt"
+        "chatInput": prompt,  # Sends the new prompt under the key "chatInput"
+        "email": user_email # Add user email to the payload
     }
     try:
         response = requests.post(N8N_REPROMPT_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
+
+        # Check status code first
         if response.status_code == 200:
-            st.success("✅ Reprompt request sent successfully.")
-            return True
+            try:
+                # Attempt to parse JSON response
+                response_data = response.json()
+                # Check for specific success indicators in the response body
+                # MUST have status 200 AND (status:success OR message:Workflow was started)
+                if response_data.get("status") == "success" or response_data.get("message") == "Workflow was started":
+                    st.success("✅ Reprompt request acknowledged successfully by n8n.")
+                    return True
+                else:
+                    # Got a 200 OK, but the body indicates a different message or failure
+                    error_message = response_data.get("message", "Reprompt webhook returned 200 OK but response body did not indicate expected success.")
+                    st.error(f"❌ Reprompt failed (n8n response): {error_message}")
+                    return False
+            except requests.exceptions.JSONDecodeError:
+                # Got a 200 OK, but the response wasn't valid JSON - Treat as failure
+                st.error("❌ Reprompt failed: Webhook returned success status (200) but response body was not valid JSON.")
+                return False
+            except Exception as e:
+                # Other potential errors processing the response
+                st.error(f"❌ Error processing reprompt response: {e}")
+                return False
         else:
+            # Status code indicates an error
             st.error(f"❌ Failed to trigger reprompt webhook. Status Code: {response.status_code} - {response.text}")
             return False
+
     except requests.exceptions.RequestException as e:
         st.error(f"🚨 Error connecting to reprompt webhook: {e}")
         return False
@@ -166,10 +203,12 @@ def fetch_images_from_supabase(session_id):
 query_params = st.query_params
 url_session_id = query_params.get("sessionId")
 url_resume_url = query_params.get("resumeUrl") # Get resumeUrl from query params
+url_user_email = query_params.get("user_email") # Get user_email from query params
 
 if 'session_id' not in st.session_state:
     st.session_state.session_id = url_session_id
     st.session_state.resume_url = url_resume_url # Store resumeUrl in session state
+    st.session_state.user_email = url_user_email # Store user_email in session state
     st.session_state.current_index = 0
     st.session_state.image_decisions = {}
     st.session_state.submitted = False
@@ -187,12 +226,13 @@ for key, default in {
     'original_query': "",
     'data_loaded': False,
     'error_loading': False,
-    'resume_url': None # Add resume_url to session state defaults
+    'resume_url': None, # Add resume_url to session state defaults
+    'user_email': None # Add user_email to session state defaults
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# --- Validate Session ID and Resume URL ---
+# --- Validate Session ID, Resume URL, and User Email ---
 if not st.session_state.get('session_id'):
     st.error("Missing 'sessionId'. Please ensure the link includes '?sessionId=...'")
     st.stop()
@@ -201,13 +241,19 @@ if not st.session_state.get('resume_url'):
     st.error("Missing 'resumeUrl'. Please ensure the link includes '&resumeUrl=...'")
     st.stop() # Stop if resumeUrl is crucial
 
-# Display Session ID and Query prominently
+if not st.session_state.get('user_email'):
+    st.warning("Missing 'user_email' query parameter. Reprompting might require it.")
+    # Decide if you want to st.stop() here or just warn
+
+# Display Session ID, Query, and Email prominently
 st.subheader("Image Review Session")
-col_info1, col_info2 = st.columns(2)
+col_info1, col_info2, col_info3 = st.columns(3) # Added a third column for email
 with col_info1:
     st.metric("Session ID", st.session_state.session_id)
 with col_info2:
     st.metric("Original Query", st.session_state.original_query if st.session_state.original_query else "N/A")
+with col_info3: # Display User Email
+    st.metric("User Email", st.session_state.user_email if st.session_state.user_email else "N/A")
 st.divider()
 
 # --- Load Data From Supabase Once Per Session ---
@@ -320,19 +366,39 @@ st.subheader("Reprompt Agent")
 if not st.session_state.submitted:
     new_prompt = st.text_area("Provide new instructions or a refined query:", value=st.session_state.original_query, key="reprompt_text_area")
     if st.button("🔄 Send New Prompt to Agent", key="reprompt_button", disabled=not new_prompt.strip()):
-        # Calls the updated function
-        if trigger_reprompt_webhook(st.session_state.session_id, new_prompt):
-            # Clear relevant state and cache, then rerun to show loading/wait state
-            st.info("Reprompt sent. Clearing current view and waiting for new images...")
-            st.session_state.all_images_data = []
-            st.session_state.current_index = 0
-            st.session_state.image_decisions = {}
-            st.session_state.data_loaded = False # Force reload
-            st.session_state.error_loading = False
-            fetch_images_from_supabase.clear() # Clear cache
-            st.rerun() # Rerun to reflect state changes and trigger loading spinner
+        session_id = st.session_state.session_id
+        user_email = st.session_state.user_email # Get email from session state
+
+        # Step 1: Delete all existing images for the session
+        st.info("Deleting existing images...")
+        if delete_all_images_for_session(session_id):
+            st.success("Existing images cleared.")
+            
+            # Step 2: Trigger the resume URL to ensure n8n is active
+            st.info("Ensuring n8n workflow is active...")
+            if trigger_n8n_webhook(): # Use the existing function that hits the resumeUrl
+                st.success("n8n workflow resumed/active.")
+
+                # Step 3: Send the new prompt
+                st.info("Sending new prompt...")
+                # Pass user_email to the function call
+                if trigger_reprompt_webhook(session_id, new_prompt, user_email):
+                    # Clear relevant state and cache, then rerun to show loading/wait state
+                    st.info("Reprompt sent. Clearing current view and waiting for new images...")
+                    st.session_state.all_images_data = []
+                    st.session_state.current_index = 0
+                    st.session_state.image_decisions = {}
+                    st.session_state.data_loaded = False # Force reload
+                    st.session_state.error_loading = False
+                    fetch_images_from_supabase.clear() # Clear cache
+                    st.rerun() # Rerun to reflect state changes and trigger loading spinner
+                else:
+                    st.error("Failed to send the new prompt.") # Error specific to reprompt webhook
+            else:
+                st.error("Failed to trigger the n8n resume URL. Reprompt aborted.") # Error specific to resume webhook
         else:
-            st.error("Failed to complete the reprompt process.") # General error if any step failed
+            st.error("Failed to delete existing images. Reprompt aborted.") # Error specific to deletion
+
 elif st.session_state.submitted:
     st.info("Review already submitted. Reprompting is disabled.")
 
